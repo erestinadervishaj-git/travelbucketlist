@@ -257,7 +257,7 @@ class _DestinationsListPageState extends State<DestinationsListPage> {
         if (lines[i].toLowerCase().startsWith('reason:')) {
           description = lines[i].replaceFirst(RegExp(r'reason:\s*', caseSensitive: false), '').trim();
           if (i + 1 < lines.length) {
-            description += '\n' + lines.sublist(i + 1).join('\n').trim();
+            description = '$description\n${lines.sublist(i + 1).join('\n').trim()}';
           }
           break;
         }
@@ -274,7 +274,7 @@ class _DestinationsListPageState extends State<DestinationsListPage> {
             builder: (_) => DestinationDetailsPage(destination: item),
           ),
         ).then((value) {
-          if (value == true) {
+          if (value == true && mounted) {
             Navigator.of(context).pop(true); // Refresh parent
           }
         });

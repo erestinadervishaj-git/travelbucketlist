@@ -134,6 +134,8 @@ class _GalleryPageState extends State<GalleryPage> {
     // Reload countries list to ensure we have all visited countries
     await _loadCountriesWithVisited();
     
+    if (!mounted) return;
+    
     if (_countries.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -144,6 +146,7 @@ class _GalleryPageState extends State<GalleryPage> {
       return;
     }
 
+    if (!mounted) return;
     showDialog(
       context: context,
       builder: (context) => Dialog(
@@ -429,10 +432,10 @@ class _GalleryPageState extends State<GalleryPage> {
     );
   }
 
-  Future<void> _deletePhoto(Map<String, dynamic> photo, String countryName, BuildContext context) async {
+  Future<void> _deletePhoto(Map<String, dynamic> photo, String countryName, BuildContext dialogContext) async {
     // Show confirmation dialog
     final confirmed = await showDialog<bool>(
-      context: context,
+      context: dialogContext,
       builder: (context) => Dialog(
         backgroundColor: Colors.transparent,
         child: Container(
@@ -559,6 +562,10 @@ class _GalleryPageState extends State<GalleryPage> {
     );
 
     if (confirmed == true) {
+      if (!mounted) return;
+      final navigator = Navigator.of(context);
+      final messenger = ScaffoldMessenger.of(context);
+      
       try {
         setState(() {
           _isLoading = true;
@@ -567,37 +574,36 @@ class _GalleryPageState extends State<GalleryPage> {
         final imageId = photo['id'].toString();
         final imageUrl = photo['image_url'] as String;
 
-        // Close the gallery dialog if it's open (for full-screen view)
-        if (Navigator.of(context).canPop()) {
-          Navigator.of(context).pop();
-        }
-
         // Delete the photo
         await _supabaseService.deleteDestinationImage(imageId, imageUrl);
 
         // Reload photos
         await _loadPhotos();
 
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Photo deleted successfully!'),
-              backgroundColor: Colors.green,
-            ),
-          );
+        if (!mounted) return;
+        
+        // Close the gallery dialog if it's open (for full-screen view)
+        if (navigator.canPop()) {
+          navigator.pop();
         }
+        
+        messenger.showSnackBar(
+          const SnackBar(
+            content: Text('Photo deleted successfully!'),
+            backgroundColor: Colors.green,
+          ),
+        );
       } catch (e) {
-        if (mounted) {
-          setState(() {
-            _isLoading = false;
-          });
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Error deleting photo: ${e.toString()}'),
-              backgroundColor: Colors.red,
-            ),
-          );
-        }
+        if (!mounted) return;
+        setState(() {
+          _isLoading = false;
+        });
+        messenger.showSnackBar(
+          SnackBar(
+            content: Text('Error deleting photo: ${e.toString()}'),
+            backgroundColor: Colors.red,
+          ),
+        );
       }
     }
   }

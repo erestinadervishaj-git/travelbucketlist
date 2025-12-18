@@ -381,6 +381,7 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  // ignore: unused_element
   Future<void> _toggleVisitedStatus(Map<String, dynamic> item) async {
     try {
       // Plus button should always mark as visited (true), not toggle
@@ -1153,6 +1154,7 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  // ignore: unused_element
   Widget _buildMountainBackground() {
     return CustomPaint(
       painter: MountainPainter(),
@@ -1390,6 +1392,7 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  // ignore: unused_element
   Widget _buildDestinationItem(Map<String, dynamic> item, String cardType) {
     final country = item['countries'] as Map<String, dynamic>?;
     final countryName = country?['name'] ?? 'Unknown';
