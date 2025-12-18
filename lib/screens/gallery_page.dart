@@ -20,7 +20,21 @@ class _GalleryPageState extends State<GalleryPage> {
   @override
   void initState() {
     super.initState();
-    _loadPhotos();
+    _initializeGallery();
+  }
+
+  Future<void> _initializeGallery() async {
+    // Clean up invalid blob URLs first
+    try {
+      final userId = _supabaseService.currentUser?.id;
+      if (userId != null) {
+        await _supabaseService.cleanupInvalidImageUrls(userId);
+      }
+    } catch (e) {
+      debugPrint('Error cleaning up invalid URLs: $e');
+    }
+    // Then load photos
+    await _loadPhotos();
   }
 
   Future<void> _loadPhotos() async {
@@ -30,15 +44,24 @@ class _GalleryPageState extends State<GalleryPage> {
 
     try {
       final userId = _supabaseService.currentUser?.id;
-      if (userId == null) return;
+      if (userId == null) {
+        if (mounted) {
+          setState(() {
+            _isLoading = false;
+          });
+        }
+        return;
+      }
 
       // Get all visited destinations with their images
       final visitedItems = await _supabaseService.getVisitedItems(userId);
       
+      debugPrint('Gallery: Loaded $visitedItems.length visited items');
+      
       final Map<String, List<Map<String, dynamic>>> grouped = {};
       final Set<String> countriesWithVisited = {};
       
-      // First, collect all countries that have visited destinations
+      // Process each visited destination
       for (var item in visitedItems) {
         final country = item['countries'] as Map<String, dynamic>?;
         final countryName = country?['name'] ?? 'Unknown';
@@ -48,26 +71,70 @@ class _GalleryPageState extends State<GalleryPage> {
         if (!grouped.containsKey(countryName)) {
           grouped[countryName] = [];
         }
-      }
-      
-      // Then, load images for each destination
-      for (var item in visitedItems) {
-        final country = item['countries'] as Map<String, dynamic>?;
-        final countryName = country?['name'] ?? 'Unknown';
         
-        // Get images for this destination
-        final images = await _supabaseService.getDestinationImages(
-          item['id'].toString(),
-        );
+        // Get images from nested destination_images or fetch separately
+        List<Map<String, dynamic>> images = [];
+        
+        // First, try to get images from nested structure (if available)
+        final nestedImages = item['destination_images'] as List<dynamic>?;
+        if (nestedImages != null && nestedImages.isNotEmpty) {
+          images = nestedImages.cast<Map<String, dynamic>>();
+            debugPrint('Gallery: Found $images.length nested images for $countryName');
+        } else {
+          // Fallback: fetch images separately
+          try {
+            images = await _supabaseService.getDestinationImages(
+              item['id'].toString(),
+            );
+            debugPrint('Gallery: Fetched $images.length images separately for $countryName');
+          } catch (e) {
+            debugPrint('Gallery: Error fetching images for item ${item['id']}: $e');
+          }
+        }
         
         // Add destination info to each image
         for (var image in images) {
-          grouped[countryName]!.add({
-            ...image,
-            'destination': item,
-            'destination_name': _getDestinationName(item),
-          });
+          var imageUrl = image['image_url'] as String?;
+          
+          // Skip blob URLs - they're temporary and won't work
+          if (imageUrl != null && imageUrl.startsWith('blob:')) {
+            debugPrint('Gallery: Skipping image with invalid blob URL: ${image['id']}');
+            debugPrint('Gallery: This image needs to be re-uploaded to fix the URL');
+            // Auto-delete blob URLs
+            try {
+              await _supabaseService.client.from('destination_images').delete().eq('id', image['id']);
+              debugPrint('Gallery: Auto-deleted blob URL image: ${image['id']}');
+            } catch (e) {
+              debugPrint('Gallery: Error deleting blob URL image: $e');
+            }
+            continue;
+          }
+          
+          // Validate and clean URL
+          if (imageUrl != null && imageUrl.isNotEmpty) {
+            imageUrl = imageUrl.trim();
+            
+            // Ensure it's a valid HTTP/HTTPS URL
+            if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
+              debugPrint('Gallery: Adding image with URL: $imageUrl');
+              grouped[countryName]!.add({
+                ...image,
+                'image_url': imageUrl, // Use cleaned URL
+                'destination': item,
+                'destination_name': _getDestinationName(item),
+              });
+            } else {
+              debugPrint('Gallery: Invalid URL format (not http/https): $imageUrl');
+            }
+          } else {
+            debugPrint('Gallery: Skipping image with empty URL: ${image['id']}');
+          }
         }
+      }
+      
+      debugPrint('Gallery: Grouped photos by ${grouped.length} countries');
+      for (var entry in grouped.entries) {
+        debugPrint('Gallery: ${entry.key}: ${entry.value.length} photos');
       }
       
       if (mounted) {
@@ -77,7 +144,9 @@ class _GalleryPageState extends State<GalleryPage> {
           _isLoading = false;
         });
       }
-    } catch (e) {
+    } catch (e, stackTrace) {
+      debugPrint('Gallery: Error loading photos: $e');
+      debugPrint('Gallery: Stack trace: $stackTrace');
       if (mounted) {
         setState(() {
           _isLoading = false;
@@ -90,6 +159,115 @@ class _GalleryPageState extends State<GalleryPage> {
         );
       }
     }
+  }
+
+
+  Widget _buildImageWidget(String imageUrl) {
+    // Use a more robust image loading approach
+    // Try loading with error handling and retry logic
+    return Image.network(
+      imageUrl,
+      fit: BoxFit.cover,
+      // Don't use headers that might cause CORS issues
+      // Let the browser handle CORS naturally
+      loadingBuilder: (context, child, loadingProgress) {
+        if (loadingProgress == null) return child;
+        return Container(
+          color: Colors.grey[800],
+          child: Center(
+            child: CircularProgressIndicator(
+              value: loadingProgress.expectedTotalBytes != null
+                  ? loadingProgress.cumulativeBytesLoaded /
+                      loadingProgress.expectedTotalBytes!
+                  : null,
+              color: Colors.orange,
+            ),
+          ),
+        );
+      },
+      errorBuilder: (context, error, stackTrace) {
+        debugPrint('Gallery: Error loading image: $imageUrl');
+        debugPrint('Gallery: Error type: ${error.runtimeType}');
+        debugPrint('Gallery: Error: $error');
+        
+        // Show the URL in the error for debugging
+        return Container(
+          color: Colors.grey[800],
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.broken_image, color: Colors.white, size: 32),
+              const SizedBox(height: 4),
+              Text(
+                'Failed to load',
+                style: GoogleFonts.poppins(
+                  fontSize: 10,
+                  color: Colors.white70,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: Text(
+                  imageUrl.length > 40 ? '${imageUrl.substring(0, 40)}...' : imageUrl,
+                  style: GoogleFonts.poppins(
+                    fontSize: 8,
+                    color: Colors.white54,
+                  ),
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+      // Add frameBuilder to handle loading states better
+      frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+        if (wasSynchronouslyLoaded) return child;
+        return AnimatedOpacity(
+          opacity: frame == null ? 0 : 1,
+          duration: const Duration(milliseconds: 300),
+          child: child,
+        );
+      },
+    );
+  }
+
+  void _showDebugInfo() {
+    final buffer = StringBuffer();
+    buffer.writeln('Gallery Debug Info:\n');
+    buffer.writeln('Countries: ${_countries.length}');
+    buffer.writeln('Photos by country:');
+    
+    for (var entry in _photosByCountry.entries) {
+      buffer.writeln('\n${entry.key}: ${entry.value.length} photos');
+      for (var photo in entry.value) {
+        final url = photo['image_url'] as String?;
+        buffer.writeln('  - URL: ${url ?? "null"}');
+        buffer.writeln('    ID: ${photo['id']}');
+      }
+    }
+    
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Debug Info'),
+        content: SingleChildScrollView(
+          child: Text(
+            buffer.toString(),
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
   }
 
   String _getDestinationName(Map<String, dynamic> item) {
@@ -268,9 +446,14 @@ class _GalleryPageState extends State<GalleryPage> {
       );
 
       if (image != null) {
+        debugPrint('Image picked: ${image.path}, name: ${image.name}');
+        
         // Find a destination for this country
         final userId = _supabaseService.currentUser?.id;
-        if (userId == null) return;
+        if (userId == null) {
+          debugPrint('User not authenticated');
+          return;
+        }
 
         final visitedItems = await _supabaseService.getVisitedItems(userId);
         Map<String, dynamic>? destinationForCountry;
@@ -289,20 +472,47 @@ class _GalleryPageState extends State<GalleryPage> {
             _isLoading = true;
           });
 
-          await _supabaseService.uploadDestinationImage(
-            destinationForCountry['id'].toString(),
-            image.path,
-          );
-
-          await _loadPhotos();
-
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('Photo added successfully!'),
-                backgroundColor: Colors.green,
-              ),
+          try {
+            debugPrint('Starting upload for destination: ${destinationForCountry['id']}');
+            
+            // Read bytes from XFile (works on both web and mobile)
+            final fileBytes = await image.readAsBytes();
+            debugPrint('Read ${fileBytes.length} bytes from image');
+            
+            await _supabaseService.uploadDestinationImage(
+              destinationForCountry['id'].toString(),
+              fileBytes,
             );
+            debugPrint('Upload completed, reloading photos...');
+
+            await _loadPhotos();
+
+            if (mounted) {
+              setState(() {
+                _isLoading = false;
+              });
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Photo added successfully!'),
+                  backgroundColor: Colors.green,
+                ),
+              );
+            }
+          } catch (e, stackTrace) {
+            debugPrint('Error uploading image: $e');
+            debugPrint('Stack trace: $stackTrace');
+            if (mounted) {
+              setState(() {
+                _isLoading = false;
+              });
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Error uploading photo: ${e.toString()}'),
+                  backgroundColor: Colors.red,
+                  duration: const Duration(seconds: 5),
+                ),
+              );
+            }
           }
         } else {
           if (mounted) {
@@ -315,7 +525,9 @@ class _GalleryPageState extends State<GalleryPage> {
           }
         }
       }
-    } catch (e) {
+    } catch (e, stackTrace) {
+      debugPrint('Error in _addPhotoForCountry: $e');
+      debugPrint('Stack trace: $stackTrace');
       if (mounted) {
         setState(() {
           _isLoading = false;
@@ -324,6 +536,7 @@ class _GalleryPageState extends State<GalleryPage> {
           SnackBar(
             content: Text('Error adding photo: ${e.toString()}'),
             backgroundColor: Colors.red,
+            duration: const Duration(seconds: 5),
           ),
         );
       }
@@ -351,16 +564,50 @@ class _GalleryPageState extends State<GalleryPage> {
                   });
                 },
                 itemBuilder: (context, index) {
-                  final imageUrl = photos[index]['image_url'] as String;
-                return Center(
-                  child: Image.network(
-                    imageUrl,
-                    fit: BoxFit.contain,
-                    errorBuilder: (context, error, stackTrace) {
-                      return const Icon(Icons.broken_image, color: Colors.white, size: 64);
-                    },
-                  ),
-                );
+                  final photo = photos[index];
+                  final imageUrl = photo['image_url'] as String?;
+                  
+                  if (imageUrl == null || imageUrl.isEmpty) {
+                    return const Center(
+                      child: Icon(Icons.broken_image, color: Colors.white, size: 64),
+                    );
+                  }
+                  
+                  return Center(
+                    child: Image.network(
+                      imageUrl,
+                      fit: BoxFit.contain,
+                      loadingBuilder: (context, child, loadingProgress) {
+                        if (loadingProgress == null) return child;
+                        return Center(
+                          child: CircularProgressIndicator(
+                            value: loadingProgress.expectedTotalBytes != null
+                                ? loadingProgress.cumulativeBytesLoaded /
+                                    loadingProgress.expectedTotalBytes!
+                                : null,
+                            color: Colors.white,
+                          ),
+                        );
+                      },
+                      errorBuilder: (context, error, stackTrace) {
+                        debugPrint('Gallery: Error loading full-screen image: $imageUrl');
+                        debugPrint('Gallery: Error: $error');
+                        return const Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(Icons.broken_image, color: Colors.white, size: 64),
+                              SizedBox(height: 16),
+                              Text(
+                                'Failed to load image',
+                                style: TextStyle(color: Colors.white70),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                  );
                 },
               ),
               Positioned(
@@ -654,8 +901,16 @@ class _GalleryPageState extends State<GalleryPage> {
           ),
           IconButton(
             icon: const Icon(Icons.refresh, color: Colors.white),
-            onPressed: _loadPhotos,
+            onPressed: () {
+              _initializeGallery(); // This will cleanup and reload
+            },
             tooltip: 'Refresh',
+          ),
+          // Debug button to show URLs
+          IconButton(
+            icon: const Icon(Icons.bug_report, color: Colors.white),
+            onPressed: _showDebugInfo,
+            tooltip: 'Debug Info',
           ),
         ],
       ),
@@ -835,8 +1090,25 @@ class _GalleryPageState extends State<GalleryPage> {
                                 ),
                                 itemCount: photos.length,
                                 itemBuilder: (context, photoIndex) {
-                                  final imageUrl = photos[photoIndex]['image_url'] as String;
                                   final photo = photos[photoIndex];
+                                  final imageUrl = photo['image_url'] as String?;
+                                  
+                                  if (imageUrl == null || imageUrl.isEmpty) {
+                                    debugPrint('Gallery: Photo at index $photoIndex has no image_url');
+                                    return Container(
+                                      decoration: BoxDecoration(
+                                        borderRadius: BorderRadius.circular(12),
+                                        border: Border.all(
+                                          color: Colors.red.withValues(alpha: 0.5),
+                                          width: 2,
+                                        ),
+                                      ),
+                                      child: const Center(
+                                        child: Icon(Icons.error_outline, color: Colors.red),
+                                      ),
+                                    );
+                                  }
+                                  
                                   return GestureDetector(
                                     onTap: () => _showImageGallery(country, photoIndex),
                                     onLongPress: () => _deletePhoto(photo, country, context),
@@ -850,16 +1122,7 @@ class _GalleryPageState extends State<GalleryPage> {
                                       ),
                                       child: ClipRRect(
                                         borderRadius: BorderRadius.circular(10),
-                                        child: Image.network(
-                                          imageUrl,
-                                          fit: BoxFit.cover,
-                                          errorBuilder: (context, error, stackTrace) {
-                                            return Container(
-                                              color: Colors.grey[800],
-                                              child: const Icon(Icons.broken_image, color: Colors.white),
-                                            );
-                                          },
-                                        ),
+                                        child: _buildImageWidget(imageUrl),
                                       ),
                                     ),
                                   );

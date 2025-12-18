@@ -266,7 +266,7 @@ class _TravelQuizPageState extends State<TravelQuizPage> {
                   const Color(0xFF2D1B3D).withValues(alpha: 0.95),
                   const Color(0xFF3D2B4D).withValues(alpha: 0.95),
                 ],
-              ),
+              ), 
               borderRadius: BorderRadius.circular(16),
               boxShadow: [
                 BoxShadow(

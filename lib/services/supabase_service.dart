@@ -1,7 +1,7 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'dart:convert';
-import 'dart:io';
 import 'package:http/http.dart' as http;
+import 'package:flutter/foundation.dart';
 
 class SupabaseService {
   static final SupabaseService _instance = SupabaseService._internal();
@@ -384,42 +384,112 @@ class SupabaseService {
   }
 
   // Image methods
-  Future<void> uploadDestinationImage(String bucketItemId, String imagePath) async {
+  // Updated to accept bytes directly to support web platform
+  Future<void> uploadDestinationImage(String bucketItemId, Uint8List fileBytes) async {
     try {
       final userId = currentUser?.id;
       if (userId == null) throw Exception('User not authenticated');
 
-      // Read the image file
-      final file = File(imagePath);
-      if (!await file.exists()) {
-        throw Exception('Image file not found');
+      if (fileBytes.isEmpty) {
+        throw Exception('Image file is empty');
       }
       
-      final fileBytes = await file.readAsBytes();
+      debugPrint('File bytes read: ${fileBytes.length} bytes');
       
       // Generate unique filename
+      // Format: userId_bucketItemId_timestamp.jpg
+      // This format allows Storage RLS policies to check if filename starts with userId
       final fileName = '${userId}_${bucketItemId}_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      debugPrint('Uploading file: $fileName to bucket: destination-images');
+      debugPrint('User ID: $userId');
+      debugPrint('Bucket item ID: $bucketItemId');
       
       // Upload to Supabase Storage bucket 'destination-images'
-      // Note: You need to create this bucket in Supabase Dashboard first
-      await client.storage
-          .from('destination-images')
-          .uploadBinary(
-            fileName,
-            fileBytes,
-          );
+      try {
+        await client.storage
+            .from('destination-images')
+            .uploadBinary(
+              fileName,
+              fileBytes,
+              fileOptions: const FileOptions(
+                upsert: false, // Don't overwrite existing files
+                cacheControl: '3600',
+              ),
+            );
+        debugPrint('Upload successful for: $fileName');
+      } catch (uploadError) {
+        debugPrint('Upload error: $uploadError');
+        debugPrint('Upload error type: ${uploadError.runtimeType}');
+        // Provide more helpful error message
+        if (uploadError.toString().contains('row-level security') || 
+            uploadError.toString().contains('403')) {
+          throw Exception('Storage upload failed: Check Storage bucket policies. Make sure the bucket is public or has proper RLS policies for authenticated users.');
+        }
+        rethrow;
+      }
       
-      // Get public URL
+      // Get public URL - ensure bucket is set to public in Supabase Dashboard
       final urlResponse = client.storage
           .from('destination-images')
           .getPublicUrl(fileName);
       
+      debugPrint('Public URL from Supabase: $urlResponse');
+      debugPrint('URL type check - starts with http: ${urlResponse.startsWith('http')}');
+      debugPrint('URL type check - starts with https: ${urlResponse.startsWith('https')}');
+      
+      // Verify it's not a blob URL (should never happen, but check anyway)
+      if (urlResponse.startsWith('blob:')) {
+        debugPrint('ERROR: Got blob URL from getPublicUrl!');
+        throw Exception('Invalid URL format returned from storage - got blob URL instead of HTTP URL');
+      }
+      
+      // Ensure we have a proper HTTP/HTTPS URL
+      if (!urlResponse.startsWith('http://') && !urlResponse.startsWith('https://')) {
+        debugPrint('ERROR: URL does not start with http/https: $urlResponse');
+        throw Exception('Invalid URL format returned from storage: $urlResponse');
+      }
+      
+      // Test if URL is accessible (optional check)
+      try {
+        final testResponse = await http.head(Uri.parse(urlResponse));
+        debugPrint('URL accessibility test - Status: ${testResponse.statusCode}');
+        if (testResponse.statusCode != 200 && testResponse.statusCode != 403) {
+          debugPrint('WARNING: URL returned status ${testResponse.statusCode}, might not be accessible');
+        }
+      } catch (e) {
+        debugPrint('URL accessibility test failed (might be OK): $e');
+      }
+      
       // Save the public URL to database
-      await client.from('destination_images').insert({
+      debugPrint('Saving URL to database: $urlResponse');
+      debugPrint('Bucket item ID: $bucketItemId');
+      debugPrint('User ID: $userId');
+      
+      // Verify the bucket_item_id belongs to the user before inserting
+      try {
+        final bucketItem = await client
+            .from('bucket_list_items')
+            .select('id, user_id')
+            .eq('id', bucketItemId)
+            .eq('user_id', userId)
+            .single();
+        
+        debugPrint('Verified bucket item belongs to user: ${bucketItem['id']}');
+      } catch (e) {
+        debugPrint('ERROR: Bucket item verification failed: $e');
+        throw Exception('Cannot add image: Destination does not belong to you or does not exist');
+      }
+      
+      // Insert the image URL
+      final insertResult = await client.from('destination_images').insert({
         'bucket_item_id': bucketItemId,
         'image_url': urlResponse,
-      });
-    } catch (e) {
+      }).select();
+      
+      debugPrint('Image URL saved successfully to database: $insertResult');
+    } catch (e, stackTrace) {
+      debugPrint('Error in uploadDestinationImage: $e');
+      debugPrint('Stack trace: $stackTrace');
       rethrow;
     }
   }
@@ -439,10 +509,18 @@ class SupabaseService {
             // Find the index of 'destination-images' and get the filename after it
             final bucketIndex = pathSegments.indexOf('destination-images');
             if (bucketIndex != -1 && bucketIndex < pathSegments.length - 1) {
+              // Get all segments after 'destination-images' to handle folder structure
               final fileName = pathSegments.sublist(bucketIndex + 1).join('/');
-              await client.storage
-                  .from('destination-images')
-                  .remove([fileName]);
+              debugPrint('Deleting storage file: $fileName');
+              try {
+                await client.storage
+                    .from('destination-images')
+                    .remove([fileName]);
+                debugPrint('Storage file deleted successfully');
+              } catch (e) {
+                debugPrint('Error deleting storage file: $e');
+                // Continue even if storage deletion fails
+              }
             }
           }
         }
@@ -455,14 +533,92 @@ class SupabaseService {
     }
   }
 
+  // Clean up invalid blob URLs from database
+  Future<void> cleanupInvalidImageUrls(String userId) async {
+    try {
+      // Get all images for this user
+      final allItems = await getVisitedItems(userId);
+      final imageIdsToDelete = <String>[];
+      
+      for (var item in allItems) {
+        final images = item['destination_images'] as List<dynamic>?;
+        if (images != null) {
+          for (var img in images) {
+            final imageUrl = img['image_url'] as String?;
+            if (imageUrl != null && imageUrl.startsWith('blob:')) {
+              imageIdsToDelete.add(img['id'].toString());
+              debugPrint('Found invalid blob URL image: ${img['id']}');
+            }
+          }
+        }
+      }
+      
+      // Delete invalid images
+      if (imageIdsToDelete.isNotEmpty) {
+        debugPrint('Deleting ${imageIdsToDelete.length} invalid blob URL images');
+        for (var id in imageIdsToDelete) {
+          try {
+            await client.from('destination_images').delete().eq('id', id);
+          } catch (e) {
+            debugPrint('Error deleting invalid image $id: $e');
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('Error cleaning up invalid URLs: $e');
+    }
+  }
+
   Future<List<Map<String, dynamic>>> getDestinationImages(String bucketItemId) async {
     try {
       final response = await client
           .from('destination_images')
           .select()
           .eq('bucket_item_id', bucketItemId);
-      return List<Map<String, dynamic>>.from(response);
+      
+      final images = List<Map<String, dynamic>>.from(response);
+      
+      // Process images and ensure URLs are accessible
+      final processedImages = <Map<String, dynamic>>[];
+      for (var image in images) {
+        var imageUrl = image['image_url'] as String?;
+        debugPrint('Gallery: Original image URL from DB: $imageUrl');
+        
+        // Check if this is a blob URL (temporary, won't work) - skip it
+        if (imageUrl != null && imageUrl.startsWith('blob:')) {
+          debugPrint('Gallery: Skipping blob URL - invalid');
+          // Auto-delete blob URLs
+          try {
+            await client.from('destination_images').delete().eq('id', image['id']);
+            debugPrint('Gallery: Deleted invalid blob URL image: ${image['id']}');
+          } catch (e) {
+            debugPrint('Gallery: Error deleting blob URL image: $e');
+          }
+          continue;
+        }
+        
+        // If URL exists and is a Supabase storage URL, use it directly
+        // Since bucket is public, public URL should work
+        if (imageUrl != null && imageUrl.isNotEmpty && !imageUrl.startsWith('blob:')) {
+          // Verify it's a proper HTTP/HTTPS URL
+          if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
+            // Ensure URL is properly formatted (no extra spaces, etc.)
+            imageUrl = imageUrl.trim();
+            processedImages.add({
+              ...image,
+              'image_url': imageUrl,
+            });
+            debugPrint('Gallery: Added valid image URL: $imageUrl');
+          } else {
+            debugPrint('Gallery: Invalid URL format (not http/https): $imageUrl');
+          }
+        }
+      }
+      
+      debugPrint('Gallery: Returning ${processedImages.length} valid images');
+      return processedImages;
     } catch (e) {
+      debugPrint('Error fetching destination images: $e');
       rethrow;
     }
   }

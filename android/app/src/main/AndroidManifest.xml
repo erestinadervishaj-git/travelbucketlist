@@ -1,4 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Internet permission required for loading OpenStreetMap tiles -->
+    <uses-permission android:name="android.permission.INTERNET"/>
     <application
         android:label="ai_mobile_erestinadervishaj1"
         android:name="${applicationName}"
